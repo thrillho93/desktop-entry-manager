@@ -1,53 +1,56 @@
-# manage_apps
+# desktop_entry_manager
 
-A bash script for managing the GNOME application menu. It combines two
-utilities: an alphabetizer for the app grid and folders, and a tool to
-disable unwanted desktop entries.
+A bash script for managing `.desktop` entry files on Linux. It combines two
+utilities: a GNOME app grid alphabetizer, and a universal tool to hide unwanted
+application launcher entries.
 
 ## Features
 
-### Alphabetize
-- Sorts apps and folders together in the main GNOME app grid
+### Alphabetize *(GNOME only)*
+- Sorts apps and folders together in the GNOME app grid
 - Sorts apps within each custom folder
 - Sorts the folder list itself
 - Merges duplicate folders (same name, different IDs) before sorting
 - Skips category-based folders (automatically managed by GNOME)
 
-### Disable Apps
-- Hide unwanted desktop entries (`.desktop` files) from the app menu
+### Disable / Hide Desktop Entries *(any XDG desktop)*
+Works on any desktop environment that reads `.desktop` files — GNOME, KDE,
+XFCE, Cinnamon, etc.
+
+- Hide unwanted entries from application launchers
 - Multiple selection modes:
   - **Hardcoded list** — ships with a default set of rarely-needed system entries
-  - **Interactive** — pick apps to hide using `fzf`
-  - **Config file** — save a selection and reuse it (e.g. after updates)
-- Restore all hidden apps with one command
-- List currently hidden apps
+  - **Interactive** — pick entries to hide using `fzf`
+  - **Config file** — save a selection and reuse it (e.g. after package updates restore entries)
+- Restore all hidden entries with one command
+- List currently hidden entries
 
 ## Requirements
 
-- `python3` — required (used for GVariant parsing)
+- `python3` — required (used for GVariant parsing in the GNOME alphabetize feature)
+- `gsettings` — required for the alphabetize feature (standard on GNOME desktops)
 - `fzf` — optional, required only for interactive selection mode
-- `gsettings` — standard on all GNOME desktops
 
 ## Installation
 
 ```bash
 # Download
-curl -o ~/.local/bin/manage_apps \
-  https://raw.githubusercontent.com/thrillho93/manage_apps/master/manage_apps
-chmod +x ~/.local/bin/manage_apps
+curl -o ~/.local/bin/desktop_entry_manager \
+  https://raw.githubusercontent.com/thrillho93/desktop_entry_manager/master/manage_apps
+chmod +x ~/.local/bin/desktop_entry_manager
 ```
 
 Or clone and symlink:
 
 ```bash
-git clone https://github.com/thrillho93/manage_apps.git
-ln -s "$PWD/manage_apps/manage_apps" ~/.local/bin/manage_apps
+git clone https://github.com/thrillho93/desktop_entry_manager.git
+ln -s "$PWD/desktop_entry_manager/manage_apps" ~/.local/bin/desktop_entry_manager
 ```
 
 ## Usage
 
 ```bash
-manage_apps
+desktop_entry_manager
 ```
 
 A menu will appear:
@@ -63,7 +66,7 @@ Choose an action:
   3) Exit
 ```
 
-### Alphabetize
+### Alphabetize *(GNOME only)*
 
 Selecting option 1 will:
 1. Clean up any duplicate folders
@@ -75,23 +78,23 @@ A GNOME Shell restart is needed to see the changes:
 - **Wayland**: log out and log back in
 - **X11**: press `Alt+F2`, type `r`, press Enter
 
-### Disable Apps
+### Disable / Hide Entries *(any XDG desktop)*
 
-Selecting option 2 opens a submenu with these choices:
+Selecting option 2 opens a submenu:
 
 | Option | Description |
 |--------|-------------|
 | Hardcoded list | Hides a built-in set of rarely-used system entries |
-| Interactive (fzf) | Pick apps to hide from a searchable list |
+| Interactive (fzf) | Pick entries to hide from a searchable list |
 | Interactive + save | Same as above, but saves your selection to a config file |
 | Use saved config | Re-apply a previously saved selection |
-| List hidden apps | Show all currently hidden entries |
+| List hidden entries | Show all currently hidden entries |
 | Restore all | Unhide everything |
 
 Hiding works by renaming `.desktop` files to `.desktop.bak`. Restoring
-renames them back. This requires `sudo`.
+renames them back. Requires `sudo` since entries live in `/usr/share/applications`.
 
-### Default hidden apps (hardcoded list)
+### Default hidden entries (hardcoded list)
 
 ```
 avahi-discover, bssh, bvnc, qv4l2, qvidcap,
