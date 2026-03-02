@@ -1,4 +1,4 @@
-# desktop_entry_manager
+# desktop-entry-manager
 
 A bash script for managing `.desktop` entry files on Linux. It combines two
 utilities: a GNOME app grid alphabetizer, and a universal tool to hide unwanted
@@ -35,22 +35,22 @@ XFCE, Cinnamon, etc.
 
 ```bash
 # Download
-curl -o ~/.local/bin/desktop_entry_manager \
-  https://raw.githubusercontent.com/thrillho93/desktop_entry_manager/master/manage_apps
-chmod +x ~/.local/bin/desktop_entry_manager
+curl -o ~/.local/bin/desktop-entry-manager \
+  https://raw.githubusercontent.com/thrillho93/desktop-entry-manager/master/manage_apps
+chmod +x ~/.local/bin/desktop-entry-manager
 ```
 
 Or clone and symlink:
 
 ```bash
-git clone https://github.com/thrillho93/desktop_entry_manager.git
-ln -s "$PWD/desktop_entry_manager/manage_apps" ~/.local/bin/desktop_entry_manager
+git clone https://github.com/thrillho93/desktop-entry-manager.git
+ln -s "$PWD/desktop-entry-manager/manage_apps" ~/.local/bin/desktop-entry-manager
 ```
 
 ## Usage
 
 ```bash
-desktop_entry_manager
+desktop-entry-manager
 ```
 
 A menu will appear:
