@@ -1,0 +1,1235 @@
+#!/usr/bin/env bash
+# manage-apps - Combined script for launcher app management
+#
+# This script provides two functionalities:
+# 1. Alphabetize GNOME application menu apps and folders
+# 2. Disable/hide unwanted desktop applications
+#
+# Usage: ./manage-apps
+
+set -euo pipefail
+
+# Check for required dependencies
+if ! command -v python3 &>/dev/null; then
+    echo "Error: python3 is required but not installed"
+    exit 1
+fi
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Helper functions
+info() {
+    echo -e "${GREEN}[INFO]${NC} $*"
+}
+
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $*"
+}
+
+error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+}
+
+# Parse gsettings array output using Python (handles quotes and special chars)
+parse_gsettings_array() {
+    local input="$1"
+    python3 -c "
+import sys, ast, json
+
+input_str = sys.argv[1]
+
+# Handle empty array
+if input_str.strip() in ['@as []', '[]', '']:
+    sys.exit(0)
+
+# Remove @as prefix if present
+if input_str.startswith('@as '):
+    input_str = input_str[4:]
+
+try:
+    # Try to parse as Python literal (handles GVariant format)
+    parsed = ast.literal_eval(input_str)
+    if isinstance(parsed, list):
+        for item in parsed:
+            print(item)
+except:
+    # Fallback: try basic string parsing
+    cleaned = input_str.strip('[]').replace(\"'\", '').replace('\"', '')
+    if cleaned:
+        for item in cleaned.split(', '):
+            if item:
+                print(item)
+" "$input"
+}
+
+# Get gsettings value with error handling
+gsettings_get() {
+    local schema="$1"
+    local key="$2"
+    local result
+
+    if ! result=$(gsettings get "$schema" "$key" 2>&1); then
+        error "Failed to get $schema $key: $result"
+        return 1
+    fi
+
+    echo "$result"
+    return 0
+}
+
+# Set gsettings value with error handling
+gsettings_set() {
+    local schema="$1"
+    local key="$2"
+    local value="$3"
+    local result
+
+    if ! result=$(gsettings set "$schema" "$key" "$value" 2>&1); then
+        error "Failed to set $schema $key: $result"
+        return 1
+    fi
+
+    return 0
+}
+
+# Check if data appears corrupted
+is_corrupted_data() {
+    local data="$1"
+
+    # Check for excessive escaping
+    if [[ "$data" == *"\\\\\\\\"* ]]; then
+        return 0  # corrupted
+    fi
+
+    # Check for malformed nested arrays
+    if [[ "$data" == *'["['* ]] || [[ "$data" == *'"]"]'* ]]; then
+        return 0  # corrupted
+    fi
+
+    # Note: Mixed quotes like ['app.desktop', "App's Name.desktop"] are normal
+    # gsettings uses double quotes for strings containing single quotes
+    # So we don't check for mixed quotes as corruption anymore
+
+    return 1  # not corrupted
+}
+
+# =============================================================================
+# ALPHABETIZE FUNCTIONALITY
+# =============================================================================
+
+# Get the display name from a .desktop file
+get_desktop_name() {
+    local desktop_file="$1"
+    local name=""
+
+    # Search in common locations
+    for dir in \
+        /usr/share/applications \
+        ~/.local/share/applications \
+        /var/lib/flatpak/exports/share/applications \
+        ~/.local/share/flatpak/exports/share/applications; do
+        if [[ -f "$dir/$desktop_file" ]]; then
+            name=$(grep -m1 "^Name=" "$dir/$desktop_file" 2>/dev/null | cut -d'=' -f2- || echo "")
+            [[ -n "$name" ]] && break
+        fi
+    done
+
+    # Fallback to filename without .desktop extension
+    if [[ -z "$name" ]]; then
+        name=$(basename "$desktop_file" .desktop)
+    fi
+
+    echo "$name"
+}
+
+# Check if a desktop file should be displayed in GNOME
+should_display_desktop_file() {
+    local desktop_file="$1"
+    local filepath=""
+
+    # Find the desktop file
+    for dir in \
+        /usr/share/applications \
+        ~/.local/share/applications \
+        /var/lib/flatpak/exports/share/applications \
+        ~/.local/share/flatpak/exports/share/applications; do
+        if [[ -f "$dir/$desktop_file" ]]; then
+            filepath="$dir/$desktop_file"
+            break
+        fi
+    done
+
+    [[ -z "$filepath" ]] && return 1
+
+    # Check NoDisplay
+    if grep -q "^NoDisplay=true" "$filepath" 2>/dev/null; then
+        return 1
+    fi
+
+    # Check Hidden
+    if grep -q "^Hidden=true" "$filepath" 2>/dev/null; then
+        return 1
+    fi
+
+    # Check OnlyShowIn (if present, must include GNOME)
+    local only_show_in=$(grep "^OnlyShowIn=" "$filepath" 2>/dev/null | cut -d'=' -f2-)
+    if [[ -n "$only_show_in" ]]; then
+        if [[ "$only_show_in" != *"GNOME"* ]]; then
+            return 1
+        fi
+    fi
+
+    # Check NotShowIn (if present, must not include GNOME)
+    local not_show_in=$(grep "^NotShowIn=" "$filepath" 2>/dev/null | cut -d'=' -f2-)
+    if [[ -n "$not_show_in" ]]; then
+        if [[ "$not_show_in" == *"GNOME"* ]]; then
+            return 1
+        fi
+    fi
+
+    # Check if the Exec binary exists
+    local exec_line=$(grep "^Exec=" "$filepath" 2>/dev/null | head -1 | cut -d'=' -f2-)
+    if [[ -n "$exec_line" ]]; then
+        # Extract the command (first word, removing % arguments)
+        local binary=$(echo "$exec_line" | awk '{print $1}' | sed 's/%.*$//')
+        # Check if it's a full path or needs PATH lookup
+        if [[ "$binary" == /* ]]; then
+            # Absolute path
+            [[ ! -x "$binary" ]] && return 1
+        else
+            # Needs PATH lookup
+            if ! command -v "$binary" &>/dev/null; then
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Get all .desktop files from standard directories (filtered for display)
+get_all_desktop_files() {
+    local files=()
+
+    for dir in \
+        /usr/share/applications \
+        ~/.local/share/applications \
+        /var/lib/flatpak/exports/share/applications \
+        ~/.local/share/flatpak/exports/share/applications; do
+        if [[ -d "$dir" ]]; then
+            while IFS= read -r -d '' file; do
+                local desktop_file=$(basename "$file")
+                # Only include if should be displayed
+                if should_display_desktop_file "$desktop_file"; then
+                    files+=("$desktop_file")
+                fi
+            done < <(find "$dir" -maxdepth 1 -name "*.desktop" -type f -print0 2>/dev/null)
+        fi
+    done
+
+    # Remove duplicates and sort
+    printf '%s\n' "${files[@]}" | sort -u
+}
+
+# Get apps matched by categories in a folder (with exclusions)
+get_apps_by_categories() {
+    local folder_id="$1"
+    local categories_raw="$2"
+    local matched_apps=()
+
+    # Parse categories
+    local categories=()
+    while IFS= read -r cat; do
+        [[ -n "$cat" ]] && categories+=("$cat")
+    done < <(parse_gsettings_array "$categories_raw")
+
+    # If no categories, return empty
+    [[ ${#categories[@]} -eq 0 ]] && return 0
+
+    # Get excluded apps for this folder
+    local excluded_apps_raw
+    excluded_apps_raw=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ excluded-apps) || excluded_apps_raw="@as []"
+
+    declare -A excluded_map
+    if [[ -n "$excluded_apps_raw" && "$excluded_apps_raw" != "@as []" ]]; then
+        while IFS= read -r app; do
+            [[ -n "$app" ]] && excluded_map["$app"]=1
+        done < <(parse_gsettings_array "$excluded_apps_raw")
+    fi
+
+    # Search desktop files for matching categories
+    for dir in \
+        /usr/share/applications \
+        ~/.local/share/applications \
+        /var/lib/flatpak/exports/share/applications \
+        ~/.local/share/flatpak/exports/share/applications; do
+
+        [[ ! -d "$dir" ]] && continue
+
+        while IFS= read -r -d '' file; do
+            local desktop_file=$(basename "$file")
+
+            # Skip if excluded
+            [[ -n "${excluded_map[$desktop_file]:-}" ]] && continue
+
+            # Skip if should not be displayed (NoDisplay, Hidden, OnlyShowIn/NotShowIn)
+            should_display_desktop_file "$desktop_file" || continue
+
+            # Get Categories line from desktop file
+            local file_categories=$(grep -m1 "^Categories=" "$file" 2>/dev/null | cut -d'=' -f2-)
+
+            # Check if any of the folder categories match
+            for cat in "${categories[@]}"; do
+                if [[ "$file_categories" == *"$cat"* ]]; then
+                    matched_apps+=("$desktop_file")
+                    break
+                fi
+            done
+        done < <(find "$dir" -maxdepth 1 -name "*.desktop" -type f -print0 2>/dev/null)
+    done
+
+    # Return unique apps
+    if [[ ${#matched_apps[@]} -gt 0 ]]; then
+        printf '%s\n' "${matched_apps[@]}" | sort -u
+    fi
+}
+
+# Get apps that are in folders (both explicit apps and category-matched)
+get_apps_in_folders() {
+    local folder_children
+    local apps_in_folders=()
+
+    # Get folder list with error handling
+    folder_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || return 1
+
+    # Parse folder list using Python
+    while IFS= read -r folder_id; do
+        [[ -z "$folder_id" ]] && continue
+
+        # Check for explicit apps
+        local apps
+        apps=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ apps) || continue
+
+        # Get explicit apps if not empty/corrupted
+        if [[ -n "$apps" && "$apps" != "@as []" ]] && ! is_corrupted_data "$apps"; then
+            while IFS= read -r app; do
+                [[ -n "$app" ]] && apps_in_folders+=("$app")
+            done < <(parse_gsettings_array "$apps")
+        fi
+
+        # Check for category-based apps
+        local categories
+        categories=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ categories) || continue
+
+        if [[ -n "$categories" && "$categories" != "@as []" ]]; then
+            while IFS= read -r app; do
+                [[ -n "$app" ]] && apps_in_folders+=("$app")
+            done < <(get_apps_by_categories "$folder_id" "$categories")
+        fi
+    done < <(parse_gsettings_array "$folder_children")
+
+    # Return unique apps
+    if [[ ${#apps_in_folders[@]} -gt 0 ]]; then
+        printf '%s\n' "${apps_in_folders[@]}" | sort -u
+    fi
+}
+
+# Alphabetize apps in the main grid (not in folders)
+alphabetize_main_grid() {
+    info "Alphabetizing main application grid..."
+
+    # Get all desktop files
+    local all_apps=$(get_all_desktop_files)
+
+    # Get apps in folders with error handling
+    local apps_in_folders
+    apps_in_folders=$(get_apps_in_folders) || {
+        error "Failed to get apps in folders"
+        return 1
+    }
+
+    # Build list of apps NOT in folders
+    declare -A folder_apps_map
+    while IFS= read -r app; do
+        [[ -n "$app" ]] && folder_apps_map["$app"]=1
+    done <<< "$apps_in_folders"
+
+    # Create array of main grid apps with their display names
+    declare -A main_apps
+    declare -A app_display_to_file
+    while IFS= read -r desktop_file; do
+        [[ -z "$desktop_file" ]] && continue
+
+        # Skip if in a folder
+        [[ -n "${folder_apps_map[$desktop_file]:-}" ]] && continue
+
+        local display_name=$(get_desktop_name "$desktop_file")
+        app_display_to_file["$display_name"]="$desktop_file"
+    done <<< "$all_apps"
+
+    # Get folder IDs with error handling
+    local folder_children
+    folder_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || {
+        error "Failed to get folder list"
+        return 1
+    }
+
+    # Build map of folder display names to IDs
+    declare -A folder_display_to_id
+    while IFS= read -r folder_id; do
+        [[ -z "$folder_id" ]] && continue
+
+        local folder_name
+        folder_name=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ name) || continue
+
+        # Remove quotes
+        folder_name=$(python3 -c "import sys; print(sys.argv[1].strip(\"'\\\"\"))" "$folder_name")
+
+        folder_display_to_id["$folder_name"]="$folder_id"
+    done < <(parse_gsettings_array "$folder_children")
+
+    # Combine all display names (apps and folders) and sort them alphabetically
+    local all_names=()
+    for name in "${!app_display_to_file[@]}"; do
+        all_names+=("$name")
+    done
+    for name in "${!folder_display_to_id[@]}"; do
+        all_names+=("$name")
+    done
+
+    # Build sorted list (interleaved apps and folders by display name)
+    local sorted_apps=()
+    while IFS= read -r display_name; do
+        # Check if it's an app or folder and add the appropriate ID
+        if [[ -n "${app_display_to_file[$display_name]:-}" ]]; then
+            sorted_apps+=("${app_display_to_file[$display_name]}")
+        elif [[ -n "${folder_display_to_id[$display_name]:-}" ]]; then
+            sorted_apps+=("${folder_display_to_id[$display_name]}")
+        fi
+    done < <(printf '%s\n' "${all_names[@]}" | sort -f)
+
+    # Edge case: check if we have any items (fix for issue #6)
+    if [[ ${#sorted_apps[@]} -eq 0 ]]; then
+        warn "No apps found for main grid"
+        return 0
+    fi
+
+    info "Found ${#sorted_apps[@]} items in main grid (${#app_display_to_file[@]} apps + ${#folder_display_to_id[@]} folders)"
+
+    # Build new app-picker-layout in GVariant format
+    local new_layout
+    new_layout=$(python3 -c '
+import sys
+items = sys.argv[1:]
+parts = []
+for i, item in enumerate(items):
+    # Escape backslashes and double quotes for GVariant double-quoted strings
+    escaped_item = item.replace("\\", "\\\\").replace("\"", "\\\"")
+    parts.append(f"\"{escaped_item}\": <{{\"position\": <{i}>}}>")
+layout = "[{" + ", ".join(parts) + "}]"
+print(layout)
+' "${sorted_apps[@]}")
+
+    if gsettings_set org.gnome.shell app-picker-layout "$new_layout"; then
+        info "Rebuilt app grid layout with alphabetized apps and folders"
+        return 0
+    else
+        error "Failed to set app grid layout"
+        return 1
+    fi
+}
+
+# Alphabetize a single folder
+alphabetize_folder() {
+    local folder_id="$1"
+    local folder_name="$2"
+
+    info "Alphabetizing folder: $folder_name"
+
+    # Check if folder uses categories instead of explicit apps
+    local categories_raw
+    categories_raw=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ categories) || {
+        error "  Failed to get categories for folder $folder_id"
+        return 1
+    }
+
+    # If folder uses categories, skip it (can't alphabetize pattern-matched apps)
+    if [[ -n "$categories_raw" && "$categories_raw" != "@as []" ]]; then
+        local category_count=0
+        while IFS= read -r cat; do
+            [[ -n "$cat" ]] && ((category_count++))
+        done < <(parse_gsettings_array "$categories_raw")
+
+        if [[ $category_count -gt 0 ]]; then
+            info "  Folder uses categories (pattern-based), skipping alphabetization"
+            return 0
+        fi
+    fi
+
+    # Get current apps with error handling
+    local apps_raw
+    apps_raw=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ apps) || {
+        error "  Failed to get apps for folder $folder_id"
+        return 1
+    }
+
+    # Check if folder is empty
+    if [[ "$apps_raw" == "@as []" || -z "$apps_raw" ]]; then
+        warn "  Folder is empty, skipping"
+        return 0
+    fi
+
+    # Check for corrupted data
+    if is_corrupted_data "$apps_raw"; then
+        error "  Folder has corrupted data, skipping"
+        return 1
+    fi
+
+    # Parse the array using Python
+    local apps_list=()
+    while IFS= read -r desktop_file; do
+        [[ -n "$desktop_file" ]] && apps_list+=("$desktop_file")
+    done < <(parse_gsettings_array "$apps_raw")
+
+    # Check if we got any apps
+    if [[ ${#apps_list[@]} -eq 0 ]]; then
+        warn "  No valid apps found in folder"
+        return 0
+    fi
+
+    # Create array of display_name:desktop_file pairs to handle duplicates
+    local name_file_pairs=()
+    for desktop_file in "${apps_list[@]}"; do
+        local display_name=$(get_desktop_name "$desktop_file")
+        name_file_pairs+=("$display_name|||$desktop_file")
+    done
+
+    # Sort by display name (case-insensitive), then by filename
+    local sorted_files=()
+    while IFS= read -r pair; do
+        # Extract desktop file from pair
+        local desktop_file="${pair#*|||}"
+        sorted_files+=("$desktop_file")
+    done < <(printf '%s\n' "${name_file_pairs[@]}" | sort -t'|' -k1f,1 -k3,3)
+
+    # Build new array using Python to handle quotes properly
+    local new_array
+    new_array=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1:]))' "${sorted_files[@]}")
+
+    # Set the alphabetized order with error handling
+    if gsettings_set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ apps "$new_array"; then
+        info "  Alphabetized ${#sorted_files[@]} apps"
+        return 0
+    else
+        error "  Failed to set alphabetized apps"
+        return 1
+    fi
+}
+
+# Clean up duplicate folders (same name, different IDs)
+cleanup_duplicate_folders() {
+    info "Checking for duplicate folders..."
+
+    # Get folder list with error handling
+    local folder_children
+    folder_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || {
+        error "Failed to get folder list"
+        return 1
+    }
+
+    # Build associative arrays: name -> first_id and name -> all_ids
+    declare -A first_folder_id
+    declare -A all_folder_ids
+
+    while IFS= read -r folder_id; do
+        [[ -z "$folder_id" ]] && continue
+
+        local folder_name
+        folder_name=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ name) || {
+            warn "Failed to get name for folder $folder_id, using ID as name"
+            folder_name="$folder_id"
+        }
+
+        # Remove quotes from folder name using Python
+        folder_name=$(python3 -c "import sys; print(sys.argv[1].strip(\"'\\\"\"))" "$folder_name")
+
+        # Track first occurrence and all occurrences
+        if [[ -z "${first_folder_id[$folder_name]:-}" ]]; then
+            first_folder_id[$folder_name]="$folder_id"
+            all_folder_ids[$folder_name]="$folder_id"
+        else
+            all_folder_ids[$folder_name]="${all_folder_ids[$folder_name]}|$folder_id"
+        fi
+    done < <(parse_gsettings_array "$folder_children")
+
+    # Check for duplicates and merge apps
+    local folders_to_remove=()
+    for folder_name in "${!all_folder_ids[@]}"; do
+        local ids="${all_folder_ids[$folder_name]}"
+
+        # If there are duplicates (contains |)
+        if [[ "$ids" == *"|"* ]]; then
+            warn "Found duplicate folders for '$folder_name'"
+
+            # Collect all unique apps and categories from duplicates
+            local all_apps=()
+            local all_categories=()
+            IFS='|' read -ra id_array <<< "$ids"
+
+            for folder_id in "${id_array[@]}"; do
+                # Get explicit apps
+                local apps_raw
+                apps_raw=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ apps) || {
+                    warn "  Failed to read apps from folder $folder_id, marking for removal"
+                    folders_to_remove+=("$folder_id")
+                    continue
+                }
+
+                # Parse apps if not empty/corrupted
+                if [[ -n "$apps_raw" && "$apps_raw" != "@as []" ]]; then
+                    if is_corrupted_data "$apps_raw"; then
+                        warn "  Folder $folder_id has corrupted app data, will be removed"
+                        folders_to_remove+=("$folder_id")
+                        continue
+                    fi
+
+                    while IFS= read -r app; do
+                        [[ -n "$app" ]] && all_apps+=("$app")
+                    done < <(parse_gsettings_array "$apps_raw")
+                fi
+
+                # Get categories
+                local categories_raw
+                categories_raw=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ categories) || continue
+
+                # Parse categories if not empty
+                if [[ -n "$categories_raw" && "$categories_raw" != "@as []" ]]; then
+                    while IFS= read -r cat; do
+                        [[ -n "$cat" ]] && all_categories+=("$cat")
+                    done < <(parse_gsettings_array "$categories_raw")
+                fi
+            done
+
+            # Remove duplicates and set to first folder (fix for empty array issue)
+            if [[ ${#all_apps[@]} -eq 0 && ${#all_categories[@]} -eq 0 ]]; then
+                warn "  No valid apps or categories found in any duplicate folder for '$folder_name'"
+                # Mark all duplicates for removal
+                for folder_id in "${id_array[@]}"; do
+                    folders_to_remove+=("$folder_id")
+                done
+                continue
+            fi
+
+            local first_id="${first_folder_id[$folder_name]}"
+            local merge_success=true
+
+            # Merge apps if any exist
+            if [[ ${#all_apps[@]} -gt 0 ]]; then
+                local unique_apps=($(printf '%s\n' "${all_apps[@]}" | sort -u))
+
+                local new_apps_array
+                new_apps_array=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1:]))' "${unique_apps[@]}")
+
+                if gsettings_set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$first_id/ apps "$new_apps_array"; then
+                    info "  Merged ${#unique_apps[@]} unique apps into folder $first_id"
+                else
+                    error "  Failed to merge apps into folder $first_id"
+                    merge_success=false
+                fi
+            fi
+
+            # Merge categories if any exist
+            if [[ ${#all_categories[@]} -gt 0 ]]; then
+                local unique_categories=($(printf '%s\n' "${all_categories[@]}" | sort -u))
+
+                local new_categories_array
+                new_categories_array=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1:]))' "${unique_categories[@]}")
+
+                if gsettings_set org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$first_id/ categories "$new_categories_array"; then
+                    info "  Merged ${#unique_categories[@]} unique categories into folder $first_id"
+                else
+                    error "  Failed to merge categories into folder $first_id"
+                    merge_success=false
+                fi
+            fi
+
+            # Mark other IDs for removal (except the first one) only if merge succeeded
+            if [[ "$merge_success" == true ]]; then
+                for folder_id in "${id_array[@]}"; do
+                    if [[ "$folder_id" != "$first_id" ]]; then
+                        folders_to_remove+=("$folder_id")
+                    fi
+                done
+            fi
+        fi
+    done
+
+    # Remove duplicate folder IDs from folder-children
+    if [[ ${#folders_to_remove[@]} -gt 0 ]]; then
+        local current_children
+        current_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || {
+            error "Failed to get folder list for cleanup"
+            return 1
+        }
+
+        local kept_folders=()
+        while IFS= read -r folder_id; do
+            [[ -z "$folder_id" ]] && continue
+
+            # Check if this folder should be removed
+            local should_remove=false
+            for remove_id in "${folders_to_remove[@]}"; do
+                if [[ "$folder_id" == "$remove_id" ]]; then
+                    should_remove=true
+                    break
+                fi
+            done
+
+            if [[ "$should_remove" == false ]]; then
+                kept_folders+=("$folder_id")
+            fi
+        done < <(parse_gsettings_array "$current_children")
+
+        # Check if we have any folders left (edge case fix)
+        if [[ ${#kept_folders[@]} -eq 0 ]]; then
+            warn "No folders remaining after cleanup"
+            return 0
+        fi
+
+        # Build new folder-children array
+        local new_children
+        new_children=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1:]))' "${kept_folders[@]}")
+
+        if gsettings_set org.gnome.desktop.app-folders folder-children "$new_children"; then
+            info "Removed ${#folders_to_remove[@]} duplicate folder(s)"
+        else
+            error "Failed to update folder list"
+            return 1
+        fi
+    else
+        info "No duplicate folders found"
+    fi
+
+    return 0
+}
+
+# Alphabetize the folder order itself
+alphabetize_folder_order() {
+    info "Alphabetizing folder order..."
+
+    # Get folder list with error handling
+    local folder_children
+    folder_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || {
+        error "Failed to get folder list"
+        return 1
+    }
+
+    # Build map of folder names to IDs
+    declare -A folder_names
+    while IFS= read -r folder_id; do
+        [[ -z "$folder_id" ]] && continue
+
+        local folder_name
+        folder_name=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ name) || {
+            warn "Failed to get name for folder $folder_id, using ID"
+            folder_name="$folder_id"
+        }
+
+        # Remove quotes
+        folder_name=$(python3 -c "import sys; print(sys.argv[1].strip(\"'\\\"\"))" "$folder_name")
+
+        folder_names["$folder_name"]="$folder_id"
+    done < <(parse_gsettings_array "$folder_children")
+
+    # Sort folder IDs by name
+    local sorted_folder_ids=()
+    while IFS= read -r folder_name; do
+        sorted_folder_ids+=("${folder_names[$folder_name]}")
+    done < <(printf '%s\n' "${!folder_names[@]}" | sort -f)
+
+    # Check if we have any folders
+    if [[ ${#sorted_folder_ids[@]} -eq 0 ]]; then
+        warn "No folders found"
+        return 0
+    fi
+
+    # Build new folder-children array
+    local new_children
+    new_children=$(python3 -c 'import sys, json; print(json.dumps(sys.argv[1:]))' "${sorted_folder_ids[@]}")
+
+    if gsettings_set org.gnome.desktop.app-folders folder-children "$new_children"; then
+        info "Alphabetized ${#sorted_folder_ids[@]} folders by name"
+        return 0
+    else
+        error "Failed to set folder order"
+        return 1
+    fi
+}
+
+# Alphabetize all folders
+alphabetize_all_folders() {
+    info "Alphabetizing all custom folders..."
+
+    # Get folder list with error handling
+    local folder_children
+    folder_children=$(gsettings_get org.gnome.desktop.app-folders folder-children) || {
+        error "Failed to get folder list"
+        return 1
+    }
+
+    local folder_count=0
+    local success_count=0
+    while IFS= read -r folder_id; do
+        [[ -z "$folder_id" ]] && continue
+
+        # Get folder name
+        local folder_name
+        folder_name=$(gsettings_get org.gnome.desktop.app-folders.folder:/org/gnome/desktop/app-folders/folders/$folder_id/ name) || {
+            warn "Failed to get name for folder $folder_id, using ID"
+            folder_name="$folder_id"
+        }
+
+        # Remove quotes using Python
+        folder_name=$(python3 -c "import sys; print(sys.argv[1].strip(\"'\\\"\"))" "$folder_name")
+
+        ((folder_count++)) || true
+        if alphabetize_folder "$folder_id" "$folder_name"; then
+            ((success_count++)) || true
+        fi
+    done < <(parse_gsettings_array "$folder_children")
+
+    if [[ $folder_count -eq 0 ]]; then
+        warn "No custom folders found"
+    else
+        info "Processed $folder_count folders ($success_count successful)"
+    fi
+
+    return 0
+}
+
+# Main alphabetize function
+do_alphabetize() {
+    echo "╔════════════════════════════════════════════════════╗"
+    echo "║      GNOME Application Menu Alphabetizer           ║"
+    echo "╚════════════════════════════════════════════════════╝"
+    echo
+
+    # Check if GNOME Shell is running (race condition warning)
+    if pgrep -x "gnome-shell" > /dev/null; then
+        warn "GNOME Shell is currently running"
+        warn "For best results, close all GNOME app grid windows before continuing"
+        echo
+        read -p "Press Enter to continue or Ctrl+C to cancel..."
+        echo
+    fi
+
+    # Clean up duplicate folders first
+    if ! cleanup_duplicate_folders; then
+        error "Failed to clean up duplicate folders"
+        return 1
+    fi
+    echo
+
+    # Alphabetize folder order
+    if ! alphabetize_folder_order; then
+        error "Failed to alphabetize folder order"
+        return 1
+    fi
+    echo
+
+    # Alphabetize main grid
+    if ! alphabetize_main_grid; then
+        error "Failed to alphabetize main grid"
+        return 1
+    fi
+    echo
+
+    # Alphabetize all folders
+    if ! alphabetize_all_folders; then
+        error "Failed to alphabetize folders"
+        return 1
+    fi
+    echo
+
+    info "✓ Done! All applications alphabetized."
+    echo
+    info "To see the changes:"
+    info "  - Log out and log back in (recommended)"
+    info "  - Or on X11, press Alt+F2, type 'r', press Enter (restarts GNOME Shell)"
+    echo
+    warn "Note: GNOME Shell restart (Alt+F2, 'r') may not work on Wayland - use logout/login instead"
+}
+
+# =============================================================================
+# DISABLE APPS FUNCTIONALITY
+# =============================================================================
+
+DESKTOP_DIR="/usr/share/applications"
+CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/disable-desktop-apps.conf"
+MODE="hardcoded"
+SAVE_CONFIG=0
+
+# Default hardcoded list (kept for backwards compatibility)
+DESKTOP_FILES=(
+    "avahi-discover.desktop"
+    "bssh.desktop"
+    "bvnc.desktop"
+    "qv4l2.desktop"
+    "qvidcap.desktop"
+    "electron37.desktop"
+    "uuctl.desktop"
+    "xgps.desktop"
+    "xgpsspeed.desktop"
+    "nm-connection-editor.desktop"
+)
+
+# Check if running with sufficient privileges, prompt for sudo if needed
+check_privileges() {
+    if [[ $EUID -ne 0 ]]; then
+        info "This operation requires root privileges. Please enter your password:"
+        if ! sudo -v; then
+            error "Failed to obtain root privileges"
+            exit 1
+        fi
+    fi
+}
+
+# Extract the Name field from a .desktop file (for disable functionality)
+get_desktop_name_disable() {
+    local filepath="$1"
+    local name=""
+
+    # Try to get Name from [Desktop Entry] section
+    name=$(grep -m1 "^Name=" "$filepath" 2>/dev/null | cut -d'=' -f2- || echo "")
+
+    # Fallback to filename without .desktop extension
+    if [[ -z "$name" ]]; then
+        name=$(basename "$filepath" .desktop)
+    fi
+
+    echo "$name"
+}
+
+# List all available desktop applications with their names
+list_desktop_apps() {
+    local desktop_files=()
+
+    while IFS= read -r -d '' file; do
+        local filename=$(basename "$file")
+        local name=$(get_desktop_name_disable "$file")
+        # Format: "App Name | filename.desktop"
+        desktop_files+=("$name | $filename")
+    done < <(find "$DESKTOP_DIR" -maxdepth 1 -name "*.desktop" -type f -print0 2>/dev/null | sort -z)
+
+    printf '%s\n' "${desktop_files[@]}"
+}
+
+# Interactive selection with fzf
+select_with_fzf() {
+    if ! command -v fzf &>/dev/null; then
+        error "fzf is not installed. Install it with: sudo pacman -S fzf"
+        exit 1
+    fi
+
+    info "Loading desktop applications..."
+    local selections
+
+    selections=$(list_desktop_apps | fzf \
+        --multi \
+        --height=80% \
+        --border \
+        --prompt="Select apps to hide (Tab to select, Enter to confirm): " \
+        --header="Navigate with arrows, Tab to select multiple, Enter to confirm" \
+        --preview="basename {2}" \
+        --preview-window=right:30% \
+        --bind='ctrl-a:select-all,ctrl-d:deselect-all')
+
+    if [[ -z "$selections" ]]; then
+        warn "No applications selected. Exiting."
+        exit 0
+    fi
+
+    # Extract just the filenames from "App Name | filename.desktop" format
+    echo "$selections" | awk -F' \\| ' '{print $2}'
+}
+
+# Save selections to config file
+save_to_config() {
+    local files=("$@")
+    local config_dir=$(dirname "$CONFIG_FILE")
+
+    # Create config directory if it doesn't exist (as the user who ran sudo)
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        sudo -u "$SUDO_USER" mkdir -p "$config_dir"
+    else
+        mkdir -p "$config_dir"
+    fi
+
+    # Write config file
+    printf '%s\n' "${files[@]}" > "$CONFIG_FILE"
+
+    # Set proper ownership if run with sudo
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        chown "$SUDO_USER:$SUDO_USER" "$CONFIG_FILE"
+    fi
+
+    info "Saved configuration to: $CONFIG_FILE"
+}
+
+# Load selections from config file
+load_from_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        error "Config file not found: $CONFIG_FILE"
+        error "Run disable apps with interactive mode first"
+        exit 1
+    fi
+
+    mapfile -t DESKTOP_FILES < "$CONFIG_FILE"
+
+    if [[ ${#DESKTOP_FILES[@]} -eq 0 ]]; then
+        error "Config file is empty: $CONFIG_FILE"
+        exit 1
+    fi
+
+    info "Loaded ${#DESKTOP_FILES[@]} applications from config"
+}
+
+# List currently hidden applications
+list_hidden_apps() {
+    info "Currently hidden applications:"
+    echo
+
+    local count=0
+    while IFS= read -r -d '' file; do
+        local filename; filename=$(basename "$file"); filename="${filename%.bak}"; filename="${filename%.backup}"
+        local original="${DESKTOP_DIR}/${filename}"
+
+        # Try to get the app name from the backup
+        local name=$(get_desktop_name_disable "$file")
+
+        echo "  - $name ($filename)"
+        ((count++))
+    done < <(find "$DESKTOP_DIR" -maxdepth 1 \( -name "*.desktop.bak" -o -name "*.desktop.backup" \) -type f -print0 2>/dev/null | sort -z)
+
+    if [[ $count -eq 0 ]]; then
+        echo "  (none)"
+    else
+        echo
+        info "Total hidden: $count"
+    fi
+}
+
+# Restore all hidden applications
+restore_all_apps() {
+    info "Restoring all hidden applications..."
+    echo
+
+    local count=0
+    while IFS= read -r -d '' file; do
+        local filename; filename=$(basename "$file"); filename="${filename%.bak}"; filename="${filename%.backup}"
+        local original="${DESKTOP_DIR}/${filename}"
+
+        if sudo mv "$file" "$original"; then
+            info "Restored: $filename"
+            ((count++))
+        else
+            error "Failed to restore: $filename"
+        fi
+    done < <(find "$DESKTOP_DIR" -maxdepth 1 \( -name "*.desktop.bak" -o -name "*.desktop.backup" \) -type f -print0 2>/dev/null)
+
+    if [[ $count -eq 0 ]]; then
+        warn "No hidden applications found to restore"
+    else
+        echo
+        info "Restored $count applications"
+    fi
+}
+
+# Rename a single .desktop file
+rename_desktop_file() {
+    local filename="$1"
+    local filepath="${DESKTOP_DIR}/${filename}"
+    local backup_path="${filepath}.bak"
+
+    # Check if original file exists
+    if [[ ! -f "$filepath" ]]; then
+        warn "File not found: $filepath (skipping)"
+        return 0
+    fi
+
+    # If backup already exists but the .desktop file has reappeared (e.g. after
+    # a package update), overwrite the stale backup to re-disable the entry.
+    if [[ -f "$backup_path" ]]; then
+        info "Backup exists and .desktop reappeared - overwriting: $backup_path"
+    fi
+
+    # Get app name for better output
+    local app_name=$(get_desktop_name_disable "$filepath")
+
+    # Perform rename
+    if sudo mv "$filepath" "$backup_path"; then
+        info "Renamed: $app_name ($filename)"
+        return 0
+    else
+        error "Failed to rename: $filepath"
+        return 1
+    fi
+}
+
+# Submenu for disable apps options
+disable_apps_submenu() {
+    echo
+    echo "╔════════════════════════════════════════════════════╗"
+    echo "║  Disable Desktop Applications                      ║"
+    echo "╚════════════════════════════════════════════════════╝"
+    echo
+    echo "Choose an option:"
+    echo "  1) Use hardcoded list"
+    echo "  2) Select apps interactively (fzf)"
+    echo "  3) Select and save to config (fzf)"
+    echo "  4) Use saved config"
+    echo "  5) List currently hidden apps"
+    echo "  6) Restore all hidden apps"
+    echo "  7) Back to main menu"
+    echo
+
+    read -p "Enter choice [1-7]: " choice
+
+    case "$choice" in
+        1)
+            check_privileges
+            MODE="hardcoded"
+            ;;
+        2)
+            check_privileges
+            MODE="interactive"
+            SAVE_CONFIG=0
+            ;;
+        3)
+            check_privileges
+            MODE="interactive"
+            SAVE_CONFIG=1
+            ;;
+        4)
+            check_privileges
+            MODE="config"
+            ;;
+        5)
+            list_hidden_apps
+            return
+            ;;
+        6)
+            check_privileges
+            restore_all_apps
+            return
+            ;;
+        7)
+            return
+            ;;
+        *)
+            error "Invalid choice"
+            exit 1
+            ;;
+    esac
+
+    # Process the selected mode
+    case "$MODE" in
+        interactive)
+            mapfile -t DESKTOP_FILES < <(select_with_fzf)
+            if [[ $SAVE_CONFIG -eq 1 ]]; then
+                save_to_config "${DESKTOP_FILES[@]}"
+            fi
+            ;;
+        config)
+            load_from_config
+            ;;
+        hardcoded)
+            info "Using hardcoded application list"
+            ;;
+    esac
+
+    info "Starting desktop application disabler"
+    info "Target directory: $DESKTOP_DIR"
+    info "Applications to hide: ${#DESKTOP_FILES[@]}"
+    echo
+
+    local success_count=0
+    local skip_count=0
+    local fail_count=0
+
+    for desktop_file in "${DESKTOP_FILES[@]}"; do
+        if rename_desktop_file "$desktop_file"; then
+            if [[ -f "${DESKTOP_DIR}/${desktop_file}.bak" ]] && [[ ! -f "${DESKTOP_DIR}/${desktop_file}" ]]; then
+                ((success_count++)) || true
+            else
+                ((skip_count++)) || true
+            fi
+        else
+            ((fail_count++)) || true
+        fi
+    done
+
+    echo
+    info "Summary:"
+    info "  Successfully renamed: $success_count"
+    info "  Skipped: $skip_count"
+    if [[ $fail_count -gt 0 ]]; then
+        error "  Failed: $fail_count"
+    fi
+
+    if [[ $success_count -gt 0 ]]; then
+        echo
+        info "Desktop applications have been disabled. They will no longer appear in application menus."
+    fi
+
+    echo
+    info "Done."
+}
+
+# =============================================================================
+# MAIN MENU
+# =============================================================================
+
+show_main_menu() {
+    echo
+    echo "╔════════════════════════════════════════════════════╗"
+    echo "║                   Apps Manager                     ║"
+    echo "╚════════════════════════════════════════════════════╝"
+    echo
+    echo "Choose an action:"
+    echo "  1) Alphabetize GNOME apps and folders"
+    echo "  2) Disable/hide desktop applications"
+    echo "  3) Exit"
+    echo
+
+    read -p "Enter choice [1-3]: " choice
+
+    case "$choice" in
+        1)
+            do_alphabetize
+            ;;
+        2)
+            disable_apps_submenu
+            ;;
+        3)
+            info "Exiting."
+            exit 0
+            ;;
+        *)
+            error "Invalid choice. Please enter 1, 2, or 3."
+            exit 1
+            ;;
+    esac
+}
+
+# Main execution
+main() {
+    show_main_menu
+}
+
+main "$@"
